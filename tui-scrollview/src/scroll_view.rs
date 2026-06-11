@@ -213,26 +213,37 @@ impl StatefulWidget for ScrollView {
 
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
         let (mut x, mut y) = state.offset.into();
-        // ensure that we don't scroll past the end of the buffer in either direction
-        let max_x_offset = self
-            .buf
-            .area
-            .width
-            .saturating_sub(area.width.saturating_sub(1));
-        let max_y_offset = self
-            .buf
-            .area
-            .height
-            .saturating_sub(area.height.saturating_sub(1));
+        let horizontal_space = area.width as i32 - self.size.width as i32;
+        let vertical_space = area.height as i32 - self.size.height as i32;
+        let (show_horizontal, show_vertical) =
+            self.visible_scrollbars(horizontal_space, vertical_space);
+
+        // Scrollbars steal space from the viewport. Clamp offsets against that final viewport,
+        // not the raw render area, so the bottom position is the last full page of content.
+        let viewport_width = area.width.saturating_sub(show_vertical as u16);
+        let viewport_height = area.height.saturating_sub(show_horizontal as u16);
+
+        // If the content fits in a direction, discard any stale offset for that direction.
+        if horizontal_space > 0 {
+            x = 0;
+        }
+        if vertical_space > 0 {
+            y = 0;
+        }
+
+        // `saturating_sub` covers both "content smaller than viewport" and zero-sized viewport
+        // cases. Zero-sized areas later panic while rendering scrollbars, matching existing
+        // behavior, but this arithmetic still must not wrap before that boundary.
+        let max_x_offset = self.buf.area.width.saturating_sub(viewport_width);
+        let max_y_offset = self.buf.area.height.saturating_sub(viewport_height);
 
         x = x.min(max_x_offset);
         y = y.min(max_y_offset);
         state.offset = (x, y).into();
         state.size = Some(self.size);
-        state.page_size = Some(area.into());
-        let visible_area = self
-            .render_scrollbars(area, buf, state)
-            .intersection(self.buf.area);
+        let viewport_area = self.render_scrollbars(area, buf, state);
+        state.page_size = Some(viewport_area.as_size());
+        let visible_area = viewport_area.intersection(self.buf.area);
         self.render_visible_area(area, buf, visible_area);
     }
 }
@@ -248,7 +259,7 @@ impl ScrollView {
         let horizontal_space = area.width as i32 - self.size.width as i32;
         let vertical_space = area.height as i32 - self.size.height as i32;
 
-        // if it fits in that direction, reset state to reflect it
+        // If the content fits in a direction, reset state to reflect it.
         if horizontal_space > 0 {
             state.offset.x = 0;
         }
@@ -453,6 +464,238 @@ mod tests {
                 "◄██═► ",
             ])
         )
+    }
+
+    #[rstest]
+    fn is_not_at_bottom_until_the_last_row_is_visible(scroll_view: ScrollView) {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 6, 6));
+        let mut state = ScrollViewState::with_offset((0, 4).into());
+
+        scroll_view.render(buf.area, &mut buf, &mut state);
+
+        assert_eq!(
+            buf,
+            Buffer::with_lines(vec![
+                "OPQRS▲",
+                "YZABC║",
+                "IJKLM█",
+                "STUVW█",
+                "CDEFG▼",
+                "◄██═► ",
+            ])
+        );
+        assert!(!state.is_at_bottom());
+    }
+
+    #[rstest]
+    fn move_to_bottom(scroll_view: ScrollView) {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 6, 6));
+        let mut state = ScrollViewState::default();
+
+        // Prior to rendering, page and buffer size are unknown. We default to `true`.
+        assert!(state.is_at_bottom());
+
+        scroll_view.clone().render(buf.area, &mut buf, &mut state);
+
+        // The vertical view size is five which means the page size is five.
+        // We have not scrolled yet, so the view is at the top and not at the bottom.
+        // => We see the top five rows
+        assert!(!state.is_at_bottom());
+
+        // Since the content height is ten,
+        assert_eq!(state.size.unwrap().height, 10);
+        // if we scroll down one page (five rows),
+        state.scroll_down();
+        state.scroll_down();
+        state.scroll_down();
+        state.scroll_down();
+        state.scroll_down();
+
+        // we reach the bottom,
+        assert!(state.is_at_bottom());
+        assert_eq!(state.offset.y, 5);
+
+        // and we see the last five rows of the content.
+        scroll_view.render(buf.area, &mut buf, &mut state);
+        assert_eq!(
+            buf,
+            Buffer::with_lines(vec![
+                "YZABC▲",
+                "IJKLM║",
+                "STUVW█",
+                "CDEFG█",
+                "MNOPQ▼",
+                "◄██═► ",
+            ])
+        );
+
+        // We could also jump directly to the bottom...
+        state.scroll_to_bottom();
+        assert!(state.is_at_bottom());
+
+        // ...which sets the offset to the last row of content,
+        // ensuring to be at the bottom regardless of the page size.
+        assert_eq!(state.offset.y, state.size.unwrap().height - 1);
+    }
+
+    #[rstest]
+    fn rendering_at_bottom_uses_the_last_full_page(scroll_view: ScrollView) {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 11, 6));
+        let mut state = ScrollViewState::default();
+
+        state.scroll_to_bottom();
+        scroll_view.render(buf.area, &mut buf, &mut state);
+
+        assert_eq!(
+            buf,
+            Buffer::with_lines(vec![
+                "OPQRSTUVWX▲",
+                "YZABCDEFGH║",
+                "IJKLMNOPQR█",
+                "STUVWXYZAB█",
+                "CDEFGHIJKL█",
+                "MNOPQRSTUV▼",
+            ])
+        );
+        assert_eq!(state.offset.y, 4);
+        assert_eq!(state.page_size.unwrap().height, 6);
+    }
+
+    #[rstest]
+    #[case::always_always(
+        ScrollbarVisibility::Always,
+        ScrollbarVisibility::Always,
+        1,
+        1,
+        (true, true)
+    )]
+    #[case::never_never(
+        ScrollbarVisibility::Never,
+        ScrollbarVisibility::Never,
+        -1,
+        -1,
+        (false, false)
+    )]
+    #[case::always_never(
+        ScrollbarVisibility::Always,
+        ScrollbarVisibility::Never,
+        1,
+        1,
+        (true, false)
+    )]
+    #[case::never_always(
+        ScrollbarVisibility::Never,
+        ScrollbarVisibility::Always,
+        1,
+        1,
+        (false, true)
+    )]
+    #[case::automatic_never_needs_horizontal(
+        ScrollbarVisibility::Automatic,
+        ScrollbarVisibility::Never,
+        -1,
+        1,
+        (true, false)
+    )]
+    #[case::automatic_never_fits_horizontal(
+        ScrollbarVisibility::Automatic,
+        ScrollbarVisibility::Never,
+        1,
+        -1,
+        (false, false)
+    )]
+    #[case::never_automatic_needs_vertical(
+        ScrollbarVisibility::Never,
+        ScrollbarVisibility::Automatic,
+        1,
+        -1,
+        (false, true)
+    )]
+    #[case::never_automatic_fits_vertical(
+        ScrollbarVisibility::Never,
+        ScrollbarVisibility::Automatic,
+        -1,
+        1,
+        (false, false)
+    )]
+    #[case::always_automatic_exact_fit(
+        ScrollbarVisibility::Always,
+        ScrollbarVisibility::Automatic,
+        1,
+        0,
+        (true, true)
+    )]
+    #[case::always_automatic_vertical_fits(
+        ScrollbarVisibility::Always,
+        ScrollbarVisibility::Automatic,
+        1,
+        1,
+        (true, false)
+    )]
+    #[case::automatic_always_exact_fit(
+        ScrollbarVisibility::Automatic,
+        ScrollbarVisibility::Always,
+        0,
+        1,
+        (true, true)
+    )]
+    #[case::automatic_always_horizontal_fits(
+        ScrollbarVisibility::Automatic,
+        ScrollbarVisibility::Always,
+        1,
+        1,
+        (false, true)
+    )]
+    #[case::automatic_automatic_both_fit(
+        ScrollbarVisibility::Automatic,
+        ScrollbarVisibility::Automatic,
+        1,
+        1,
+        (false, false)
+    )]
+    #[case::automatic_automatic_both_overflow(
+        ScrollbarVisibility::Automatic,
+        ScrollbarVisibility::Automatic,
+        -1,
+        -1,
+        (true, true)
+    )]
+    #[case::automatic_automatic_only_vertical_overflows(
+        ScrollbarVisibility::Automatic,
+        ScrollbarVisibility::Automatic,
+        1,
+        -1,
+        (false, true)
+    )]
+    #[case::automatic_automatic_only_horizontal_overflows(
+        ScrollbarVisibility::Automatic,
+        ScrollbarVisibility::Automatic,
+        -1,
+        1,
+        (true, false)
+    )]
+    #[case::automatic_automatic_exact_fit_with_other_overflow(
+        ScrollbarVisibility::Automatic,
+        ScrollbarVisibility::Automatic,
+        0,
+        -1,
+        (true, true)
+    )]
+    fn visible_scrollbars_honors_visibility_policy(
+        #[case] horizontal_visibility: ScrollbarVisibility,
+        #[case] vertical_visibility: ScrollbarVisibility,
+        #[case] horizontal_space: i32,
+        #[case] vertical_space: i32,
+        #[case] expected: (bool, bool),
+    ) {
+        let scroll_view = ScrollView::new(Size::new(1, 1))
+            .horizontal_scrollbar_visibility(horizontal_visibility)
+            .vertical_scrollbar_visibility(vertical_visibility);
+
+        assert_eq!(
+            scroll_view.visible_scrollbars(horizontal_space, vertical_space),
+            expected
+        );
     }
 
     #[rstest]
